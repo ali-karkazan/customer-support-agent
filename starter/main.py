@@ -19,6 +19,9 @@ Invoke deployed agent:
 
 # ── Imports ───────────────────────────────────────────────────────────────────
 # These imports are provided. Do not remove them.
+from email.mime import message
+from tempfile import template
+
 from strands import Agent, tool
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from bedrock_agentcore.memory import MemoryClient
@@ -47,9 +50,7 @@ logger = logging.getLogger("CSAI_Agent")
 #
 # Hint: app = BedrockAgentCoreApp()
 
-# TODO: Create the BedrockAgentCoreApp instance
-app = None  # Replace this line
-
+app = BedrockAgentCoreApp()
 
 # Suppress interactive tool-consent prompts (required in headless deployments).
 os.environ["BYPASS_TOOL_CONSENT"] = "true"
@@ -64,10 +65,10 @@ os.environ["BYPASS_TOOL_CONSENT"] = "true"
 # REGION:     your AWS region, e.g. "us-east-1"
 # MEMORY_ID   format: shown in the AgentCore Memory console
 
-GATEWAY_URL = "<gateway_url>"   # TODO: Replace with your Gateway URL
-KB_ID       = "<kbid>"          # TODO: Replace with your Knowledge Base ID
-REGION      = "<region>"        # TODO: Replace with your AWS region
-MEMORY_ID   = "<mem_id>"        # TODO: Replace with your Memory ID
+GATEWAY_URL =   "https://customersupportgateway-t4l73skcer.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+KB_ID       = "EDJVPLBNT3"
+REGION      = "us-east-1"
+MEMORY_ID   = "CustomerSupportMemory-AcdCqz9B0C"
 
 
 # ── TODO 3 — Model and Clients ────────────────────────────────────────────────
@@ -80,14 +81,17 @@ MEMORY_ID   = "<mem_id>"        # TODO: Replace with your Memory ID
 
 model_id = "global.amazon.nova-2-lite-v1:0"
 
-# TODO: Create the BedrockModel instance
-model = None  # Replace this line
+model = BedrockModel(
+    model_id=model_id,
+    region_name=REGION,
+)
 
-# TODO: Create the MemoryClient instance
-memory_client = None  # Replace this line
+memory_client = MemoryClient(region_name=REGION)
 
-# TODO: Create the boto3 bedrock-agent-runtime client
-_bedrock_runtime = None  # Replace this line
+_bedrock_runtime = boto3.client(
+    "bedrock-agent-runtime",
+    region_name=REGION,
+)
 
 
 # ── TODO 4 — Namespace Helper ─────────────────────────────────────────────────
@@ -104,8 +108,15 @@ _bedrock_runtime = None  # Replace this line
 
 def get_namespaces(mem_client: MemoryClient, memory_id: str) -> Dict:
     """Return a dict mapping strategy type → namespace template string."""
-    # TODO: Implement this function
-    pass
+    strategies = mem_client.get_memory_strategies(memory_id=memory_id)
+    result = {}
+
+    for strategy in strategies:
+        templates = strategy.get("namespaceTemplates") or strategy.get("namespaces", [])
+        if templates:
+            result[strategy["type"]] = templates[0]
+
+    return result
 
 
 # ── TODO 5 — Memory Hook ──────────────────────────────────────────────────────
@@ -143,38 +154,117 @@ class MemoryHook(HookProvider):
         session_id: str,
         memory_client: MemoryClient,
         memory_id: str,
+
     ):
-        # TODO: Store actor_id, session_id, memory_id, memory_client as attributes
-        # TODO: Call get_namespaces() and store the result as self.namespaces
-        pass
+
+        self.actor_id = actor_id
+        self.session_id = session_id
+        self.memory_client = memory_client
+        self.memory_id = memory_id
+        self.namespaces = get_namespaces(memory_client, memory_id)
+        self.original_user_query = None,
 
     def retrieve_customer_context(self, event: MessageAddedEvent):
         """Retrieve relevant memories and prepend them to the user message."""
-        # TODO: Implement memory retrieval
-        # Steps:
-        #   1. Get the last message from event.agent.messages
-        #   2. Check it is a user message and not a tool result
-        #   3. Extract the user query text
-        #   4. For each namespace in self.namespaces, call retrieve_memories()
-        #   5. Collect non-empty memory texts with strategy type tags
-        #   6. If any found, prepend them to the user message
-        pass
+
+        messages = event.agent.messages
+        if not messages:
+            return  # No messages to process
+
+        message = messages[-1]
+        if message.get("role") != "user":
+            return  # Not a user message
+
+        content = message.get("content", [])
+        if any("toolResult" in block for block in content):
+            return  # No content to process
+
+        user_query = "\n".join(
+            block["text"] for block in content if "text" in block
+        ).strip()
+
+        if not user_query:
+            return  # Empty user query
+
+        self.original_user_query = user_query  # Store the original query for later use
+
+        memories = []
+
+        for strategy_type, template in self.namespaces.items():
+            namespace = template.format(actorId=self.actor_id)
+            retrieved = self.memory_client.retrieve_memories(
+                memory_id=self.memory_id,
+                namespace=namespace,
+                query=user_query,
+                top_k=5,
+            )
+
+            for mem in retrieved:
+                text = mem.get("content", {}).get("text", "").strip()
+                if text:
+                    memories.append(f"[{strategy_type}] {text}")
+
+        if memories:
+            context_text = "\n".join(memories)
+            message["content"] = [
+                {
+                    "text": (
+                        f"Customer Context:\n{context_text}"
+                        f"\n\n{user_query}"
+                    )
+                }
+            ] + [block for block in content if "text" not in block]
 
     def save_support_interaction(self, event: AfterInvocationEvent):
         """Save the completed turn to memory after the agent responds."""
-        # TODO: Implement memory saving
-        # Steps:
-        #   1. Get messages from event.agent.messages
-        #   2. Walk backwards to find the last user query (plain text)
-        #      and the last assistant response
-        #   3. Call memory_client.create_event() with both messages
-        pass
+
+        messages = event.agent.messages
+        customer_query = None
+        assistant_response = None
+
+        for message in reversed(messages):
+            content = message.get("content", [])
+
+            if any("toolResult" in block for block in content):
+                continue  # Skip tool result messages
+
+            text = "\n".join(
+                block["text"] for block in content if "text" in block).strip()
+
+            if not text:
+                continue  # Skip empty messages
+
+            if message.get("role") == "assistant" and assistant_response is None:
+                assistant_response = text
+
+            elif message.get("role") == "user":
+                customer_query = self.original_user_query or text
+                break  # Found the last user query and assistant response
+
+        if not customer_query or not assistant_response:
+            return
+
+        self.memory_client.create_event(
+            memory_id=self.memory_id,
+            actor_id=self.actor_id,
+            session_id=self.session_id,
+            messages=[
+                (customer_query, "USER"),
+                (assistant_response, "ASSISTANT"),
+            ],
+        )
 
     def register_hooks(self, registry: HookRegistry) -> None:  # type: ignore
         """Register both memory callbacks."""
-        # TODO: Register retrieve_customer_context on MessageAddedEvent
-        # TODO: Register save_support_interaction on AfterInvocationEvent
-        pass
+
+        registry.add_callback(
+            MessageAddedEvent,
+            self.retrieve_customer_context,
+        )
+        registry.add_callback(
+            AfterInvocationEvent,
+            self.save_support_interaction,
+        )
 
 
 # ── TODO 6 — Knowledge Base Tool ─────────────────────────────────────────────
