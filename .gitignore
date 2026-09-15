@@ -5,3 +5,5 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.bedrock_agentcore/
+.bedrock_agentcore.yaml

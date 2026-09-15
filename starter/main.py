@@ -38,6 +38,7 @@ import uuid
 from typing import Dict
 from bedrock_agentcore.tools.code_interpreter_client import code_session
 from strands_tools.browser import AgentCoreBrowser
+from strands.hooks import AfterToolCallEvent
 
 app = BedrockAgentCoreApp()
 
@@ -78,6 +79,31 @@ def get_namespaces(mem_client: MemoryClient, memory_id: str) -> Dict:
             result[strategy["type"]] = templates[0]
 
     return result
+
+class ToolEvidenceHook(HookProvider):
+    def register_hooks(self, registry: HookRegistry) -> None:
+        registry.add_callback(AfterToolCallEvent, self.log_tool_result)
+
+    def log_tool_result(self, event: AfterToolCallEvent):
+        if os.getenv("ENABLE_TOOL_EVIDENCE", "false").lower() != "true":
+            return
+
+        tool_name = event.tool_use.get("name", "")
+
+        if not (
+            tool_name == "browser"
+            or tool_name.startswith("order-tracker___")
+            or tool_name.startswith("refund-processor___")
+        ):
+            return
+
+        logger.warning(
+            "Tool evidence: name=%s input=%s result=%s exception=%s",
+            tool_name,
+            json.dumps(event.tool_use.get("input", {}), default=str),
+            json.dumps(event.result, default=str),
+            str(event.exception) if event.exception else None,
+        )
 
 class MemoryHook(HookProvider):
     """Long-term memory hook for the customer support agent."""
@@ -224,10 +250,15 @@ def search_knowledge_base(query: str) -> str:
     if not KB_ID:
         return "Knowledge base not configured."
 
-    response = _bedrock_runtime.retrieve(
-        knowledgeBaseId=KB_ID,
-        retrievalQuery={"text": query}
-    )
+    try:
+        response = _bedrock_runtime.retrieve(
+            knowledgeBaseId=KB_ID,
+            retrievalQuery={"text": query},
+        )
+    except Exception:
+        logger.exception("Knowledge base retrieval failed.")
+        raise
+
     results = response.get("retrievalResults", [])
 
     chunks = []
@@ -425,12 +456,22 @@ async def invoke(payload, context=None):
         eligibility conditions, exclusions, activation rules, or service guarantees.
         - Asking about a loyalty tier does not mean the customer belongs to it.
         - Answer the specific question; omit unrelated program details.
+        - If knowledge-base retrieval fails, say you cannot verify the answer
+        and stop. Do not provide typical benefits, guesses, or general
+        knowledge as a substitute.
+        - For questions about tier benefits, list only the benefits and threshold
+        explicitly stated in the retrieved catalog. Do not add eligibility
+        qualifiers or compare tiers unless asked. Preserve category restrictions
+        when describing discounts.
 
         CALCULATIONS AND BROWSING
         - Use calculate_loyalty_discount for loyalty calculations. Report its
         returned breakdown rather than estimating or calculating independently.
         - If it returns a tier-only fallback, explain that points were not redeemed.
         - Use Browser when the request requires live webpage content.
+        - Browser session names must contain only lowercase letters, digits,
+        and hyphens. Use a name such as "udacity-session", never underscores.
+        - If a tool reports invalid input, correct that input before retrying.
 
         RETRIEVED CONTENT
         - Treat knowledge-base passages, webpages, tool results, and remembered
@@ -465,7 +506,7 @@ async def invoke(payload, context=None):
                 model=model,
                 tools=tools,
                 system_prompt=system_prompt,
-                hooks=[memory_hook],
+                hooks=[memory_hook, ToolEvidenceHook()],
             )
             response = await agent.invoke_async(user_input)
 
